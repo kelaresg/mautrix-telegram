@@ -312,13 +312,16 @@ class BasePortal(MautrixBasePortal, ABC):
         except (MatrixRequestError, IntentError):
             cls.log.warning(f"Failed to leave room {room_id} when cleaning up room", exc_info=True)
 
-    async def cleanup_portal(self, message: str, puppets_only: bool = False) -> None:
+    async def cleanup_portal(self, message: str, puppets_only: bool = False, delete: bool = True
+                             ) -> None:
         if self.username:
             try:
                 await self.main_intent.remove_room_alias(self.alias_localpart)
             except (MatrixRequestError, IntentError):
                 self.log.warning("Failed to remove alias when cleaning up room", exc_info=True)
         await self.cleanup_room(self.main_intent, self.mxid, message, puppets_only)
+        if delete:
+            await self.delete()
 
     async def unbridge(self) -> None:
         await self.cleanup_portal("Room unbridged", puppets_only=True)
@@ -350,7 +353,10 @@ class BasePortal(MautrixBasePortal, ABC):
                               config=json.dumps(self.local_config), avatar_url=self.avatar_url,
                               encrypted=self.encrypted)
 
-    def delete(self) -> None:
+    async def delete(self) -> None:
+        self.delete_sync()
+
+    def delete_sync(self) -> None:
         try:
             del self.by_tgid[self.tgid_full]
         except KeyError:
