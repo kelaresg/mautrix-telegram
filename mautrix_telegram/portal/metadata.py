@@ -567,6 +567,10 @@ class PortalMetadata(BasePortal, ABC):
                         await puppet.intent.ensure_joined(self.mxid)
                     except Exception:
                         self.log.exception("Failed to ensure %s is joined to portal", user.mxid)
+        # Fix the bug that cannot rejoin the channel room created by others.
+        # but I am not sure whether it is reasonable to do so
+        if len(users) < 1:
+            await self.invite_to_matrix(source.mxid)
 
         # We can't trust the member list if any of the following cases is true:
         #  * There are close to 10 000 users, because Telegram might not be sending all members.
