@@ -107,6 +107,7 @@ class BasePortal(MautrixBasePortal, ABC):
 
     _db_instance: DBPortal
     _main_intent: Optional[IntentAPI]
+    _room_create_lock: asyncio.Lock
 
     def __init__(self, tgid: TelegramID, peer_type: str, tg_receiver: Optional[TelegramID] = None,
                  mxid: Optional[RoomID] = None, username: Optional[str] = None,
@@ -292,14 +293,16 @@ class BasePortal(MautrixBasePortal, ABC):
                 authenticated.append(user.mxid)
         return authenticated
 
-    async def cleanup_portal(self, message: str, puppets_only: bool = False) -> None:
+    async def cleanup_portal(self, message: str, puppets_only: bool = False, delete: bool = True
+                             ) -> None:
         if self.username:
             try:
                 await self.main_intent.remove_room_alias(self.alias_localpart)
             except (MatrixRequestError, IntentError):
                 self.log.warning("Failed to remove alias when cleaning up room", exc_info=True)
         await self.cleanup_room(self.main_intent, self.mxid, message, puppets_only)
-        self.delete()
+        if delete:
+            await self.delete()
 
     # endregion
     # region Database conversion
@@ -323,8 +326,10 @@ class BasePortal(MautrixBasePortal, ABC):
                               config=json.dumps(self.local_config), avatar_url=self.avatar_url,
                               encrypted=self.encrypted)
 
-    def delete(self) -> None:
-        # TODO the superclass delete method is async, this should be too
+    async def delete(self) -> None:
+        self.delete_sync()
+
+    def delete_sync(self) -> None:
         try:
             del self.by_tgid[self.tgid_full]
         except KeyError:
