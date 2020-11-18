@@ -20,7 +20,7 @@ import asyncio
 
 from telethon.tl.types import (TypeUpdate, UpdateNewMessage, UpdateNewChannelMessage, PeerUser,
                                UpdateShortChatMessage, UpdateShortMessage, User as TLUser, Chat,
-                               ChatForbidden)
+                               ChatForbidden, Channel)
 from telethon.tl.custom import Dialog
 from telethon.tl.types.contacts import ContactsNotModified
 from telethon.tl.functions.contacts import GetContactsRequest, SearchRequest
@@ -383,7 +383,12 @@ class User(AbstractUser, BaseUser):
                 creators.append(self._catch(f"backfilling {portal.tgid_log}",
                                             self.loop.create_task(backfill_task)))
             elif not create_limit or index < create_limit:
-                create_task = portal.create_matrix_room(self, entity, invites=[self.mxid])
+                chat_type = ''
+                if isinstance(entity, Channel):
+                    chat_type = 'channel'
+                elif isinstance(entity, Chat):
+                    chat_type = 'group'
+                create_task = portal.create_matrix_room(self, entity, invites=[self.mxid], chat_type=chat_type)
                 creators.append(self._catch(f"creating {portal.tgid_log}",
                                             self.loop.create_task(create_task)))
             index += 1

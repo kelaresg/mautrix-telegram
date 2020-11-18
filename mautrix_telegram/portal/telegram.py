@@ -531,7 +531,8 @@ class PortalTelegram(BasePortal, ABC):
                                       evt: Message) -> None:
         if not self.mxid:
             self.log.trace("Got telegram message %d, but no room exists, creating...", evt.id)
-            await self.create_matrix_room(source, invites=[source.mxid], update_if_exists=False)
+            chat_type = 'channel' if self.peer_type == "channel" else ''
+            await self.create_matrix_room(source, invites=[source.mxid], update_if_exists=False, chat_type=chat_type)
 
         if (self.peer_type == "user" and sender.tgid == self.tg_receiver
             and not sender.is_real_user and not await self.az.state_store.is_joined(self.mxid,
@@ -637,8 +638,9 @@ class PortalTelegram(BasePortal, ABC):
         create_and_exit = (MessageActionChatCreate, MessageActionChannelCreate)
         create_and_continue = (MessageActionChatAddUser, MessageActionChatJoinedByLink)
         if isinstance(action, create_and_exit) or isinstance(action, create_and_continue):
+            chat_type = 'group' if self.peer_type == "chat" else ''
             await self.create_matrix_room(source, invites=[source.mxid],
-                                          update_if_exists=isinstance(action, create_and_exit))
+                                          update_if_exists=isinstance(action, create_and_exit), chat_type=chat_type)
         if not isinstance(action, create_and_continue):
             return False
         return True
