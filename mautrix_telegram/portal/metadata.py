@@ -230,7 +230,7 @@ class PortalMetadata(BasePortal, ABC):
             await self.main_intent.get_joined_members(self.mxid)
 
     async def create_matrix_room(self, user: 'AbstractUser', entity: Union[TypeChat, User] = None,
-                                 invites: InviteList = None, update_if_exists: bool = True
+                                 invites: InviteList = None, update_if_exists: bool = True, chat_type = ''
                                  ) -> Optional[RoomID]:
         if self.mxid:
             if update_if_exists:
@@ -246,7 +246,7 @@ class PortalMetadata(BasePortal, ABC):
             return self.mxid
         async with self._room_create_lock:
             try:
-                return await self._create_matrix_room(user, entity, invites)
+                return await self._create_matrix_room(user, entity, invites, chat_type)
             except Exception:
                 self.log.exception("Fatal error creating Matrix room")
 
@@ -294,7 +294,7 @@ class PortalMetadata(BasePortal, ABC):
             self.log.warning("Failed to update bridge info", exc_info=True)
 
     async def _create_matrix_room(self, user: 'AbstractUser', entity: Union[TypeChat, User],
-                                  invites: InviteList) -> Optional[RoomID]:
+                                  invites: InviteList, chat_type: str) -> Optional[RoomID]:
         direct = self.peer_type == "user"
 
         if invites is None:
@@ -389,6 +389,8 @@ class PortalMetadata(BasePortal, ABC):
         creation_content = {}
         if not config["bridge.federate_rooms"]:
             creation_content["m.federate"] = False
+        if chat_type:
+            creation_content["chat_type"] = chat_type
 
         with self.backfill_lock:
             room_id = await self.main_intent.create_room(alias_localpart=alias, preset=preset,
