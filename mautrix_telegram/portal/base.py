@@ -104,9 +104,11 @@ class BasePortal(MautrixBasePortal, ABC):
 
     dedup: PortalDedup
     send_lock: PortalSendLock
+    _pin_lock: asyncio.Lock
 
     _db_instance: DBPortal
     _main_intent: Optional[IntentAPI]
+    _room_create_lock: asyncio.Lock
 
     def __init__(self, tgid: TelegramID, peer_type: str, tg_receiver: Optional[TelegramID] = None,
                  mxid: Optional[RoomID] = None, username: Optional[str] = None,
@@ -137,6 +139,7 @@ class BasePortal(MautrixBasePortal, ABC):
 
         self.dedup = PortalDedup(self)
         self.send_lock = PortalSendLock()
+        self._pin_lock = asyncio.Lock()
 
         if tgid:
             self.by_tgid[self.tgid_full] = self
@@ -154,6 +157,10 @@ class BasePortal(MautrixBasePortal, ABC):
         if self.tgid == self.tg_receiver:
             return str(self.tgid)
         return f"{self.tg_receiver}<->{self.tgid}"
+
+    @property
+    def name(self) -> str:
+        return self.title
 
     @property
     def alias(self) -> Optional[RoomAlias]:
@@ -175,6 +182,10 @@ class BasePortal(MautrixBasePortal, ABC):
             return PeerChat(chat_id=self.tgid)
         elif self.peer_type == "channel":
             return PeerChannel(channel_id=self.tgid)
+
+    @property
+    def is_direct(self) -> bool:
+        return self.peer_type == "user"
 
     @property
     def has_bot(self) -> bool:
@@ -272,45 +283,21 @@ class BasePortal(MautrixBasePortal, ABC):
     # endregion
     # region Matrix room cleanup
 
-    async def get_authenticated_matrix_users(self) -> List['u.User']:
+    async def get_authenticated_matrix_users(self) -> List[UserID]:
         try:
             members = await self.main_intent.get_room_members(self.mxid)
         except MatrixRequestError:
             return []
-        authenticated: List[u.User] = []
+        authenticated: List[UserID] = []
         has_bot = self.has_bot
-        for member_str in members:
-            member = UserID(member_str)
-            if p.Puppet.get_id_from_mxid(member) or member == self.main_intent.mxid:
+        for member in members:
+            if p.Puppet.get_id_from_mxid(member) or member == self.az.bot_mxid:
                 continue
             user = await u.User.get_by_mxid(member).ensure_started()
             authenticated_through_bot = has_bot and user.relaybot_whitelisted
             if authenticated_through_bot or await user.has_full_access(allow_bot=True):
-                authenticated.append(user)
+                authenticated.append(user.mxid)
         return authenticated
-
-    @classmethod
-    async def cleanup_room(cls, intent: IntentAPI, room_id: RoomID, message: str,
-                           puppets_only: bool = False) -> None:
-        # TODO use the cleanup_room from BasePortal instead of this
-        try:
-            members = await intent.get_room_members(room_id)
-        except MatrixRequestError:
-            members = []
-        for user in members:
-            puppet = await p.Puppet.get_by_mxid(UserID(user), create=False)
-            if user != intent.mxid and (not puppets_only or puppet):
-                try:
-                    if puppet:
-                        await puppet.default_mxid_intent.leave_room(room_id)
-                    else:
-                        await intent.kick_user(room_id, user, message)
-                except (MatrixRequestError, IntentError):
-                    pass
-        try:
-            await intent.leave_room(room_id)
-        except (MatrixRequestError, IntentError):
-            cls.log.warning(f"Failed to leave room {room_id} when cleaning up room", exc_info=True)
 
     async def cleanup_portal(self, message: str, puppets_only: bool = False, delete: bool = True
                              ) -> None:
@@ -322,14 +309,6 @@ class BasePortal(MautrixBasePortal, ABC):
         await self.cleanup_room(self.main_intent, self.mxid, message, puppets_only)
         if delete:
             await self.delete()
-
-    async def unbridge(self) -> None:
-        await self.cleanup_portal("Room unbridged", puppets_only=True)
-        self.delete()
-
-    async def cleanup_and_delete(self) -> None:
-        await self.cleanup_portal("Portal deleted")
-        self.delete()
 
     # endregion
     # region Database conversion
@@ -550,6 +529,7 @@ def init(context: Context) -> None:
     global config
     BasePortal.az, config, BasePortal.loop, BasePortal.bot = context.core
     BasePortal.matrix = context.mx
+    MautrixBasePortal.bridge = context.bridge
     BasePortal.max_initial_member_sync = config["bridge.max_initial_member_sync"]
     BasePortal.sync_channel_members = config["bridge.sync_channel_members"]
     BasePortal.sync_matrix_state = config["bridge.sync_matrix_state"]

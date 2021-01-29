@@ -49,7 +49,7 @@ setuptools.setup(
 
     install_requires=install_requires,
     extras_require=extras_require,
-    python_requires="~=3.6",
+    python_requires="~=3.7",
 
     setup_requires=["pytest-runner"],
     tests_require=["pytest", "pytest-asyncio", "pytest-mock"],
@@ -61,20 +61,16 @@ setuptools.setup(
         "Framework :: AsyncIO",
         "Programming Language :: Python",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.6",
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
     ],
-    entry_points="""
-        [console_scripts]
-        mautrix-telegram=mautrix_telegram.__main__:main
-    """,
     package_data={"mautrix_telegram": [
         "web/public/*.mako", "web/public/*.png", "web/public/*.css",
         "example-config.yaml",
     ]},
     data_files=[
-        (".", ["alembic.ini"]),
+        (".", ["alembic.ini", "mautrix_telegram/example-config.yaml"]),
         ("alembic", ["alembic/env.py"]),
         ("alembic/versions", glob.glob("alembic/versions/*.py"))
     ],

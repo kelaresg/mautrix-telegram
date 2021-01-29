@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from typing import Optional, Iterable
 
-from sqlalchemy import Column, Integer, String, Boolean
+from sqlalchemy import Column, Integer, String, Text, Boolean
 from sqlalchemy.sql import expression, func
 
 from mautrix.types import UserID, SyncToken
@@ -31,8 +31,10 @@ class Puppet(Base):
     custom_mxid: UserID = Column(String, nullable=True)
     access_token: str = Column(String, nullable=True)
     next_batch: SyncToken = Column(String, nullable=True)
+    base_url: str = Column(Text, nullable=True)
     displayname: str = Column(String, nullable=True)
     displayname_source: TelegramID = Column(Integer, nullable=True)
+    displayname_contact: bool = Column(Boolean, nullable=False, server_default=expression.true())
     username: str = Column(String, nullable=True)
     photo_id: str = Column(String, nullable=True)
     is_bot: bool = Column(Boolean, nullable=True)

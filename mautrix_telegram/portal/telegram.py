@@ -34,7 +34,7 @@ from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDice, MessageMediaGame, MessageMediaUnsupported, PeerUser,
     PhotoCachedSize, TypeChannelParticipant, TypeChatParticipant, TypeDocumentAttribute,
     TypeMessageAction, TypePhotoSize, PhotoSize, UpdateChatUserTyping, UpdateUserTyping,
-    MessageEntityPre, ChatPhotoEmpty)
+    MessageEntityPre, ChatPhotoEmpty, DocumentAttributeImageSize)
 
 from mautrix.appservice import IntentAPI
 from mautrix.types import (EventID, UserID, ImageInfo, ThumbnailInfo, RelatesTo, MessageType,
@@ -99,8 +99,7 @@ class PortalTelegram(BasePortal, ABC):
                                                   encrypt=self.encrypted)
         if not file:
             return None
-        if self.get_config("inline_images") and (evt.message
-                                                 or evt.fwd_from or evt.reply_to_msg_id):
+        if self.get_config("inline_images") and (evt.message or evt.fwd_from or evt.reply_to):
             content = await formatter.telegram_to_matrix(
                 evt, source, self.main_intent,
                 prefix_html=f"<img src='{file.mxc}' alt='Inline Telegram photo'/><br/>",
@@ -145,6 +144,8 @@ class PortalTelegram(BasePortal, ABC):
                 sticker_alt = attr.alt
             elif isinstance(attr, DocumentAttributeVideo):
                 width, height = attr.w, attr.h
+            elif isinstance(attr, DocumentAttributeImageSize):
+                width, height = attr.w, attr.h
         return DocAttrs(name, mime_type, is_sticker, sticker_alt, width, height)
 
     @staticmethod
@@ -186,7 +187,7 @@ class PortalTelegram(BasePortal, ABC):
                                                 width=file.thumbnail.width or thumb_size.w,
                                                 size=file.thumbnail.size)
         else:
-            # This is a hack for bad clients like Riot iOS that require a thumbnail
+            # This is a hack for bad clients like Element iOS that require a thumbnail
             if file.decryption_info:
                 info.thumbnail_file = file.decryption_info
             else:
@@ -227,9 +228,21 @@ class PortalTelegram(BasePortal, ABC):
         await intent.set_typing(self.mxid, is_typing=False)
 
         event_type = EventType.ROOM_MESSAGE
-        # Riot only supports images as stickers, so send animated webm stickers as m.video
+        # Elements only support images as stickers, so send animated webm stickers as m.video
         if attrs.is_sticker and file.mime_type.startswith("image/"):
             event_type = EventType.STICKER
+            # Tell clients to render the stickers as 256x256 if they're bigger
+            if info.width > 256 or info.height > 256:
+                if info.width > info.height:
+                    info.height = int(info.height / (info.width / 256))
+                    info.width = 256
+                else:
+                    info.width = int(info.width / (info.height / 256))
+                    info.height = 256
+            if info.thumbnail_info:
+                info.thumbnail_info.width = info.width
+                info.thumbnail_info.height = info.height
+
         content = MediaMessageEventContent(
             body=name or "unnamed file", info=info, relates_to=relates_to,
             external_url=self._get_external_url(evt),
@@ -439,12 +452,12 @@ class PortalTelegram(BasePortal, ABC):
             "max_file_size": min(config["bridge.max_document_size"], 2000) * 1024 * 1024
         }
 
-    async def backfill(self, source: 'AbstractUser', is_initial: bool = False,
+    async def backfill(self, source: 'u.User', is_initial: bool = False,
                        limit: Optional[int] = None, last_id: Optional[int] = None) -> None:
         async with self.backfill_method_lock:
             await self._locked_backfill(source, is_initial, limit, last_id)
 
-    async def _locked_backfill(self, source: 'AbstractUser', is_initial: bool = False,
+    async def _locked_backfill(self, source: 'u.User', is_initial: bool = False,
                                limit: Optional[int] = None, last_id: Optional[int] = None) -> None:
         limit = limit or (config["bridge.backfill.initial_limit"] if is_initial
                           else config["bridge.backfill.missed_limit"])
@@ -456,8 +469,11 @@ class PortalTelegram(BasePortal, ABC):
                                                else self.tgid))
         min_id = last.tgid if last else 0
         if last_id is None:
-            message = (await source.client.get_messages(self.peer, limit=1))[0]
-            last_id = message.id
+            messages = await source.client.get_messages(self.peer, limit=1)
+            if not messages:
+                # The chat seems empty
+                return
+            last_id = messages[0].id
         if last_id <= min_id:
             # Nothing to backfill
             return
@@ -481,7 +497,7 @@ class PortalTelegram(BasePortal, ABC):
         with self.backfill_lock:
             await self._backfill(source, min_id, limit)
 
-    async def _backfill(self, source: 'AbstractUser', min_id: Optional[int], limit: int) -> None:
+    async def _backfill(self, source: 'u.User', min_id: Optional[int], limit: int) -> None:
         self.backfill_leave = set()
         if ((self.peer_type == "user" and self.tgid != source.tgid
              and config["bridge.backfill.invite_own_puppet"])):
@@ -514,7 +530,8 @@ class PortalTelegram(BasePortal, ABC):
             self.log.debug(f"Iterating all messages starting with {min_id} (approx: {limit})")
             messages = client.iter_messages(entity, reverse=True, min_id=min_id)
             async for message in messages:
-                sender = p.Puppet.get(message.from_id) if message.from_id else None
+                sender = (p.Puppet.get(message.from_id.user_id)
+                          if isinstance(message.from_id, PeerUser) else None)
                 # TODO handle service messages?
                 await self.handle_telegram_message(source, sender, message)
                 count += 1
@@ -522,7 +539,8 @@ class PortalTelegram(BasePortal, ABC):
             self.log.debug(f"Fetching up to {limit} most recent messages")
             messages = await client.get_messages(entity, limit=limit)
             for message in reversed(messages):
-                sender = p.Puppet.get(message.from_id) if message.from_id else None
+                sender = (p.Puppet.get(TelegramID(message.from_id.user_id))
+                          if isinstance(message.from_id, PeerUser) else None)
                 await self.handle_telegram_message(source, sender, message)
                 count += 1
         return count
@@ -534,7 +552,7 @@ class PortalTelegram(BasePortal, ABC):
             chat_type = 'channel' if self.peer_type == "channel" else ''
             await self.create_matrix_room(source, invites=[source.mxid], update_if_exists=False, chat_type=chat_type)
 
-        if (self.peer_type == "user" and sender.tgid == self.tg_receiver
+        if (self.peer_type == "user" and sender and sender.tgid == self.tg_receiver
             and not sender.is_real_user and not await self.az.state_store.is_joined(self.mxid,
                                                                                     sender.mxid)):
             self.log.debug(f"Ignoring private chat message {evt.id}@{source.tgid} as receiver does"
@@ -572,6 +590,9 @@ class PortalTelegram(BasePortal, ABC):
                            "displayname, updating info...")
             entity = await source.client.get_entity(PeerUser(sender.tgid))
             await sender.update_info(source, entity)
+            if not sender.displayname:
+                self.log.debug(f"Telegram user {sender.tgid} doesn't have a displayname even after"
+                               f" updating with data {entity!s}")
 
         allowed_media = (MessageMediaPhoto, MessageMediaDocument, MessageMediaGeo,
                          MessageMediaGame, MessageMediaDice, MessageMediaPoll,
@@ -692,13 +713,20 @@ class PortalTelegram(BasePortal, ABC):
             levels.users[puppet.mxid] = 50
         await self.main_intent.set_power_levels(self.mxid, levels)
 
-    async def receive_telegram_pin_id(self, msg_id: TelegramID, receiver: TelegramID) -> None:
-        tg_space = receiver if self.peer_type != "channel" else self.tgid
-        message = DBMessage.get_one_by_tgid(msg_id, tg_space) if msg_id != 0 else None
-        if message:
-            await self.main_intent.set_pinned_messages(self.mxid, [message.mxid])
-        else:
-            await self.main_intent.set_pinned_messages(self.mxid, [])
+    async def receive_telegram_pin_ids(self, msg_ids: List[TelegramID], receiver: TelegramID,
+                                       remove: bool) -> None:
+        async with self._pin_lock:
+            tg_space = receiver if self.peer_type != "channel" else self.tgid
+            previously_pinned = await self.main_intent.get_pinned_messages(self.mxid)
+            currently_pinned_dict = {event_id: True for event_id in previously_pinned}
+            for message in DBMessage.get_first_by_tgids(msg_ids, tg_space):
+                if remove:
+                    currently_pinned_dict.pop(message.mxid, None)
+                else:
+                    currently_pinned_dict[message.mxid] = True
+            currently_pinned = list(currently_pinned_dict.keys())
+            if currently_pinned != previously_pinned:
+                await self.main_intent.set_pinned_messages(self.mxid, currently_pinned)
 
     async def set_telegram_admins_enabled(self, enabled: bool) -> None:
         level = 50 if enabled else 10

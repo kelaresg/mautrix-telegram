@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-from typing import Awaitable, Dict, List, Optional, Tuple, Union, Any, TYPE_CHECKING
+from typing import Awaitable, Dict, Optional, Union, Any, TYPE_CHECKING
 from html import escape as escape_html
 from string import Template
 from abc import ABC
@@ -22,21 +22,20 @@ import magic
 
 from telethon.tl.functions.messages import (EditChatPhotoRequest, EditChatTitleRequest,
                                             UpdatePinnedMessageRequest, SetTypingRequest,
-                                            EditChatAboutRequest)
+                                            EditChatAboutRequest, UnpinAllMessagesRequest)
 from telethon.tl.functions.channels import EditPhotoRequest, EditTitleRequest, JoinChannelRequest
-from telethon.errors import (ChatNotModifiedError, PhotoExtInvalidError,
-                             PhotoInvalidDimensionsError, PhotoSaveFileInvalidError,
-                             RPCError)
+from telethon.errors import (ChatNotModifiedError, PhotoExtInvalidError, MessageIdInvalidError,
+                             PhotoInvalidDimensionsError, PhotoSaveFileInvalidError, RPCError)
 from telethon.tl.patched import Message, MessageService
-from telethon.tl.types import (
-    DocumentAttributeFilename, DocumentAttributeImageSize, GeoPoint,
-    InputChatUploadedPhoto, MessageActionChatEditPhoto, MessageMediaGeo,
-    SendMessageCancelAction, SendMessageTypingAction, TypeInputPeer, TypeMessageEntity,
-    UpdateNewMessage, InputMediaUploadedDocument, InputMediaUploadedPhoto)
+from telethon.tl.types import (DocumentAttributeFilename, DocumentAttributeImageSize, GeoPoint,
+                               InputChatUploadedPhoto, MessageActionChatEditPhoto, MessageMediaGeo,
+                               SendMessageCancelAction, SendMessageTypingAction, TypeInputPeer,
+                               UpdateNewMessage, InputMediaUploadedDocument,
+                               InputMediaUploadedPhoto)
 
 from mautrix.types import (EventID, RoomID, UserID, ContentURI, MessageType, MessageEventContent,
                            TextMessageEventContent, MediaMessageEventContent, Format,
-                           LocationMessageEventContent)
+                           LocationMessageEventContent, ImageInfo, VideoInfo)
 
 from ..types import TelegramID
 from ..db import Message as DBMessage
@@ -87,9 +86,9 @@ class PortalMatrix(BasePortal, ABC):
             message = await self._get_state_change_message(event, user, **kwargs)
             if not message:
                 return
-            response = await self.bot.client.send_message(
-                self.peer, message,
-                parse_mode=self._matrix_event_to_entities)
+            message, entities = await formatter.matrix_to_telegram(self.bot.client, html=message)
+            response = await self.bot.client.send_message(self.peer, message,
+                                                          formatting_entities=entities)
             space = self.tgid if self.peer_type == "channel" else self.bot.tgid
             self.dedup.check(response, (event_id, space))
 
@@ -122,7 +121,7 @@ class PortalMatrix(BasePortal, ABC):
         if user.tgid == source.tgid:
             return None
         if self.peer_type == "user" and user.tgid == self.tgid:
-            self.delete()
+            await self.delete()
             return None
         if isinstance(user, u.User) and await user.needs_relaybot(self):
             if not self.bot:
@@ -152,7 +151,7 @@ class PortalMatrix(BasePortal, ABC):
 
         if self.peer_type == "user":
             await self.main_intent.leave_room(self.mxid)
-            self.delete()
+            await self.delete()
             try:
                 del self.by_tgid[self.tgid_full]
                 del self.by_mxid[self.mxid]
@@ -214,35 +213,23 @@ class PortalMatrix(BasePortal, ABC):
         elif content.msgtype == MessageType.EMOTE:
             await self._apply_emote_format(sender, content)
 
-    @staticmethod
-    def _matrix_event_to_entities(event: Union[str, MessageEventContent]
-                                  ) -> Tuple[str, Optional[List[TypeMessageEntity]]]:
-        try:
-            if isinstance(event, str):
-                message, entities = formatter.matrix_to_telegram(event)
-            elif isinstance(event, TextMessageEventContent) and event.format == Format.HTML:
-                message, entities = formatter.matrix_to_telegram(event.formatted_body)
-            else:
-                message, entities = formatter.matrix_text_to_telegram(event.body)
-        except KeyError:
-            message, entities = None, None
-        return message, entities
-
     async def _handle_matrix_text(self, sender_id: TelegramID, event_id: EventID,
                                   space: TelegramID, client: 'MautrixTelegramClient',
                                   content: TextMessageEventContent, reply_to: TelegramID) -> None:
+        message, entities = await formatter.matrix_to_telegram(client, text=content.body,
+                                                               html=content.formatted(Format.HTML))
         async with self.send_lock(sender_id):
             lp = self.get_config("telegram_link_preview")
             if content.get_edit():
                 orig_msg = DBMessage.get_by_mxid(content.get_edit(), self.mxid, space)
                 if orig_msg:
-                    response = await client.edit_message(self.peer, orig_msg.tgid, content,
-                                                         parse_mode=self._matrix_event_to_entities,
+                    response = await client.edit_message(self.peer, orig_msg.tgid, message,
+                                                         formatting_entities=entities,
                                                          link_preview=lp)
                     self._add_telegram_message_to_db(event_id, space, -1, response)
                     return
-            response = await client.send_message(self.peer, content, reply_to=reply_to,
-                                                 parse_mode=self._matrix_event_to_entities,
+            response = await client.send_message(self.peer, message, reply_to=reply_to,
+                                                 formatting_entities=entities,
                                                  link_preview=lp)
             self._add_telegram_message_to_db(event_id, space, 0, response)
         await self._send_delivery_receipt(event_id)
@@ -252,7 +239,10 @@ class PortalMatrix(BasePortal, ABC):
                                   content: MediaMessageEventContent, reply_to: TelegramID,
                                   caption: TextMessageEventContent = None) -> None:
         mime = content.info.mimetype
-        w, h = content.info.width, content.info.height
+        if isinstance(content.info, (ImageInfo, VideoInfo)):
+            w, h = content.info.width, content.info.height
+        else:
+            w = h = None
         file_name = content["net.maunium.telegram.internal.filename"]
         max_image_size = config["bridge.image_as_file_size"] * 1000 ** 2
 
@@ -294,19 +284,21 @@ class PortalMatrix(BasePortal, ABC):
             media = InputMediaUploadedDocument(file=file_handle, attributes=attributes,
                                                mime_type=mime or "application/octet-stream")
 
-        caption, entities = self._matrix_event_to_entities(caption) if caption else (None, None)
+        capt, entities = (await formatter.matrix_to_telegram(client, text=caption.body,
+                                                             html=caption.formatted(Format.HTML))
+                          if caption else (None, None))
 
         async with self.send_lock(sender_id):
-            if await self._matrix_document_edit(client, content, space, caption, media, event_id):
+            if await self._matrix_document_edit(client, content, space, capt, media, event_id):
                 return
             try:
                 response = await client.send_media(self.peer, media, reply_to=reply_to,
-                                                   caption=caption, entities=entities)
+                                                   caption=capt, entities=entities)
             except (PhotoInvalidDimensionsError, PhotoSaveFileInvalidError, PhotoExtInvalidError):
                 media = InputMediaUploadedDocument(file=media.file, mime_type=mime,
                                                    attributes=attributes)
                 response = await client.send_media(self.peer, media, reply_to=reply_to,
-                                                   caption=caption, entities=entities)
+                                                   caption=capt, entities=entities)
             self._add_telegram_message_to_db(event_id, space, 0, response)
         await self._send_delivery_receipt(event_id)
 
@@ -333,8 +325,8 @@ class PortalMatrix(BasePortal, ABC):
         except (KeyError, ValueError):
             self.log.exception("Failed to parse location")
             return None
-        caption, entities = self._matrix_event_to_entities(content)
-        media = MessageMediaGeo(geo=GeoPoint(lat, long, access_hash=0))
+        caption, entities = await formatter.matrix_to_telegram(client, text=content.body)
+        media = MessageMediaGeo(geo=GeoPoint(lat=lat, long=long, access_hash=0))
 
         async with self.send_lock(sender_id):
             if await self._matrix_document_edit(client, content, space, caption, media, event_id):
@@ -369,7 +361,8 @@ class PortalMatrix(BasePortal, ABC):
             await self._handle_matrix_message(sender, content, event_id)
         except RPCError as e:
             if config["bridge.delivery_error_reports"]:
-                await self._send_bridge_error(f"\u26a0 Your message may not have been bridged: {e}")
+                await self._send_bridge_error(
+                    f"\u26a0 Your message may not have been bridged: {e}")
             raise
 
     async def _handle_matrix_message(self, sender: 'u.User', content: MessageEventContent,
@@ -418,23 +411,23 @@ class PortalMatrix(BasePortal, ABC):
         else:
             self.log.trace("Unhandled Matrix event: %s", content)
 
-    async def handle_matrix_pin(self, sender: 'u.User', pinned_message: Optional[EventID],
+    async def handle_matrix_unpin_all(self, sender: 'u.User', pin_event_id: EventID) -> None:
+        await sender.client(UnpinAllMessagesRequest(peer=self.peer))
+        await self._send_delivery_receipt(pin_event_id)
+
+    async def handle_matrix_pin(self, sender: 'u.User', changes: Dict[EventID, bool],
                                 pin_event_id: EventID) -> None:
-        if self.peer_type != "chat" and self.peer_type != "channel":
-            return
-        try:
-            if not pinned_message:
-                await sender.client(UpdatePinnedMessageRequest(peer=self.peer, id=0))
-            else:
-                tg_space = self.tgid if self.peer_type == "channel" else sender.tgid
-                message = DBMessage.get_by_mxid(pinned_message, self.mxid, tg_space)
-                if message is None:
-                    self.log.warning(f"Could not find pinned {pinned_message} in {self.mxid}")
-                    return
-                await sender.client(UpdatePinnedMessageRequest(peer=self.peer, id=message.tgid))
-            await self._send_delivery_receipt(pin_event_id)
-        except ChatNotModifiedError:
-            pass
+        tg_space = self.tgid if self.peer_type == "channel" else sender.tgid
+        ids = {msg.mxid: msg.tgid
+               for msg in DBMessage.get_by_mxids(list(changes.keys()),
+                                                 mx_room=self.mxid, tg_space=tg_space)}
+        for event_id, pinned in changes.items():
+            try:
+                await sender.client(UpdatePinnedMessageRequest(peer=self.peer, id=ids[event_id],
+                                                               unpin=not pinned))
+            except (ChatNotModifiedError, MessageIdInvalidError, KeyError):
+                pass
+        await self._send_delivery_receipt(pin_event_id)
 
     async def handle_matrix_deletion(self, deleter: 'u.User', event_id: EventID,
                                      redaction_event_id: EventID) -> None:
@@ -442,12 +435,18 @@ class PortalMatrix(BasePortal, ABC):
         space = self.tgid if self.peer_type == "channel" else real_deleter.tgid
         message = DBMessage.get_by_mxid(event_id, self.mxid, space)
         if not message:
-            return
-        if message.edit_index == 0:
+            self.log.trace(f"Ignoring Matrix redaction of unknown event {event_id}")
+        elif message.redacted:
+            self.log.debug("Ignoring Matrix redaction of already redacted event "
+                           f"{message.mxid} in {message.mx_room}")
+        elif message.edit_index != 0:
+            message.edit(redacted=True)
+            self.log.debug("Ignoring Matrix redaction of edit event "
+                           f"{message.mxid} in {message.mx_room}")
+        else:
+            message.edit(redacted=True)
             await real_deleter.client.delete_messages(self.peer, [message.tgid])
             await self._send_delivery_receipt(redaction_event_id)
-        else:
-            self.log.debug(f"Ignoring deletion of edit event {message.mxid} in {message.mx_room}")
 
     async def _update_telegram_power_level(self, sender: 'u.User', user_id: TelegramID,
                                            level: int) -> None:
@@ -582,6 +581,7 @@ class PortalMatrix(BasePortal, ABC):
             except Exception:
                 self.log.warning(f"Failed to set room name", exc_info=True)
         return ok
+
 
 def init(context: Context) -> None:
     global config

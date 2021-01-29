@@ -30,14 +30,6 @@ if TYPE_CHECKING:
     from .context import Context
     from .bot import Bot
 
-try:
-    from prometheus_client import Histogram
-
-    EVENT_TIME = Histogram("matrix_event", "Time spent processing Matrix events", ["event_type"])
-except ImportError:
-    Histogram = None
-    EVENT_TIME = None
-
 RoomMetaStateEventContent = Union[RoomNameStateEventContent, RoomAvatarStateEventContent,
                                   RoomTopicStateEventContent]
 
@@ -102,9 +94,7 @@ class MatrixHandler(BaseMatrixHandler):
                 except MatrixError:
                     pass
             portal.mxid = room_id
-            e2be_ok = None
-            if self.config["bridge.encryption.default"] and self.e2ee:
-                e2be_ok = await portal.enable_dm_encryption()
+            e2be_ok = await portal.check_dm_encryption()
             await portal.save()
             await inviter.register_portal(portal)
             if e2be_ok is True:
@@ -291,13 +281,12 @@ class MatrixHandler(BaseMatrixHandler):
         portal = po.Portal.get_by_mxid(room_id)
         sender = await u.User.get_by_mxid(sender_mxid).ensure_started()
         if await sender.has_full_access(allow_bot=True) and portal:
-            events = new_events - old_events
-            if len(events) > 0:
-                # New event pinned, set that as pinned in Telegram.
-                await portal.handle_matrix_pin(sender, EventID(events.pop()), event_id)
-            elif len(new_events) == 0:
-                # All pinned events removed, remove pinned event in Telegram.
-                await portal.handle_matrix_pin(sender, None, event_id)
+            if not new_events:
+                await portal.handle_matrix_unpin_all(sender, event_id)
+            else:
+                changes = {event_id: event_id in new_events
+                           for event_id in new_events ^ old_events}
+                await portal.handle_matrix_pin(sender, changes, event_id)
 
     @staticmethod
     async def handle_room_upgrade(room_id: RoomID, sender: UserID, new_room_id: RoomID,
@@ -336,17 +325,15 @@ class MatrixHandler(BaseMatrixHandler):
             return
 
         for user_id, event_id in receipts:
-            user = await u.User.get_by_mxid(user_id).ensure_started()
-            if not await user.is_logged_in():
-                continue
-            await portal.mark_read(user, event_id)
+            user = u.User.get_by_mxid(user_id, check_db=False, create=False)
+            if user and await user.is_logged_in():
+                await portal.mark_read(user, event_id)
 
     @staticmethod
     async def handle_presence(user_id: UserID, presence: PresenceState) -> None:
-        user = await u.User.get_by_mxid(user_id).ensure_started()
-        if not await user.is_logged_in():
-            return
-        await user.set_presence(presence == PresenceState.ONLINE)
+        user = u.User.get_by_mxid(user_id, check_db=False, create=False)
+        if user and await user.is_logged_in():
+            await user.set_presence(presence == PresenceState.ONLINE)
 
     async def handle_typing(self, room_id: RoomID, now_typing: Set[UserID]) -> None:
         portal = po.Portal.get_by_mxid(room_id)
@@ -361,16 +348,16 @@ class MatrixHandler(BaseMatrixHandler):
             if is_typing and was_typing:
                 continue
 
-            user = await u.User.get_by_mxid(user_id).ensure_started()
-            if not await user.is_logged_in():
-                continue
-
-            await portal.set_typing(user, is_typing)
+            user = u.User.get_by_mxid(user_id, check_db=False, create=False)
+            if user and await user.is_logged_in():
+                await portal.set_typing(user, is_typing)
 
         self.previously_typing[room_id] = now_typing
 
     def filter_matrix_event(self, evt: Event) -> bool:
-        if not isinstance(evt, (RedactionEvent, MessageEvent, StateEvent, EncryptedEvent)):
+        if isinstance(evt, (TypingEvent, ReceiptEvent, PresenceEvent)):
+            return False
+        elif not isinstance(evt, (RedactionEvent, MessageEvent, StateEvent, EncryptedEvent)):
             return True
         if evt.content.get(self.az.real_user_content_key, False):
             puppet = pu.Puppet.deprecated_sync_get_by_custom_mxid(evt.sender)
@@ -410,7 +397,3 @@ class MatrixHandler(BaseMatrixHandler):
         elif evt.type == EventType.ROOM_TOMBSTONE:
             await self.handle_room_upgrade(evt.room_id, evt.sender, evt.content.replacement_room,
                                            evt.event_id)
-
-    async def log_event_handle_duration(self, evt: Event, duration: float) -> None:
-        if EVENT_TIME:
-            EVENT_TIME.labels(event_type=str(evt.type)).observe(duration)

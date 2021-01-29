@@ -25,18 +25,19 @@ from telethon.network import (ConnectionTcpMTProxyRandomizedIntermediate, Connec
                               Connection)
 from telethon.tl.patched import MessageService, Message
 from telethon.tl.types import (
-    Channel, Chat, MessageActionChannelMigrateFrom, PeerUser, TypeUpdate, UpdateChatPinnedMessage,
-    UpdateChannelPinnedMessage, UpdateChatParticipantAdmin, UpdateChatParticipants, PeerChat,
+    Channel, Chat, MessageActionChannelMigrateFrom, PeerUser, TypeUpdate, UpdatePinnedMessages,
+    UpdatePinnedChannelMessages, UpdateChatParticipantAdmin, UpdateChatParticipants, PeerChat,
     UpdateChatUserTyping, UpdateDeleteChannelMessages, UpdateNewMessage, UpdateDeleteMessages,
     UpdateEditChannelMessage, UpdateEditMessage, UpdateNewChannelMessage, UpdateReadHistoryOutbox,
     UpdateShortChatMessage, UpdateShortMessage, UpdateUserName, UpdateUserPhoto, UpdateUserStatus,
     UpdateUserTyping, User, UserStatusOffline, UserStatusOnline, UpdateReadHistoryInbox,
-    UpdateReadChannelInbox)
+    UpdateReadChannelInbox, MessageEmpty)
 
 from mautrix.types import UserID, PresenceState
 from mautrix.errors import MatrixError
 from mautrix.appservice import AppService
 from mautrix.util.logging import TraceLogger
+from mautrix.util.opt_prometheus import Histogram, Counter
 from alchemysession import AlchemySessionContainer
 
 from . import portal as po, puppet as pu, __version__
@@ -57,14 +58,10 @@ UpdateMessage = Union[UpdateShortChatMessage, UpdateShortMessage, UpdateNewChann
                       UpdateNewMessage, UpdateEditMessage, UpdateEditChannelMessage]
 UpdateMessageContent = Union[UpdateShortMessage, UpdateShortChatMessage, Message, MessageService]
 
-try:
-    from prometheus_client import Histogram
-
-    UPDATE_TIME = Histogram("telegram_update", "Time spent processing Telegram updates",
-                            ["update_type"])
-except ImportError:
-    Histogram = None
-    UPDATE_TIME = None
+UPDATE_TIME = Histogram("bridge_telegram_update", "Time spent processing Telegram updates",
+                        ("update_type",))
+UPDATE_ERRORS = Counter("bridge_telegram_update_error",
+                        "Number of fatal errors while handling Telegram updates", ("update_type",))
 
 
 class AbstractUser(ABC):
@@ -167,6 +164,7 @@ class AbstractUser(ABC):
             request_retries=config["telegram.connection.request_retries"],
             connection=connection,
             proxy=proxy,
+            raise_last_call_error=True,
 
             loop=self.loop,
             base_logger=base_logger
@@ -191,13 +189,14 @@ class AbstractUser(ABC):
 
     async def _update_catch(self, update: TypeUpdate) -> None:
         start_time = time.time()
+        update_type = type(update).__name__
         try:
             if not await self.update(update):
                 await self._update(update)
         except Exception:
             self.log.exception(f"Failed to handle Telegram update {update}")
-        if UPDATE_TIME:
-            UPDATE_TIME.labels(update_type=type(update).__name__).observe(time.time() - start_time)
+            UPDATE_ERRORS.labels(update_type=update_type).inc()
+        UPDATE_TIME.labels(update_type=update_type).observe(time.time() - start_time)
 
     @property
     @abstractmethod
@@ -253,7 +252,7 @@ class AbstractUser(ABC):
             await self.update_admin(update)
         elif isinstance(update, UpdateChatParticipants):
             await self.update_participants(update)
-        elif isinstance(update, (UpdateChannelPinnedMessage, UpdateChatPinnedMessage)):
+        elif isinstance(update, (UpdatePinnedMessages, UpdatePinnedChannelMessages)):
             await self.update_pinned_messages(update)
         elif isinstance(update, (UpdateUserName, UpdateUserPhoto)):
             await self.update_others_info(update)
@@ -264,14 +263,15 @@ class AbstractUser(ABC):
         else:
             self.log.trace("Unhandled update: %s", update)
 
-    async def update_pinned_messages(self, update: Union[UpdateChannelPinnedMessage,
-                                                         UpdateChatPinnedMessage]) -> None:
-        if isinstance(update, UpdateChatPinnedMessage):
-            portal = po.Portal.get_by_tgid(TelegramID(update.chat_id))
+    async def update_pinned_messages(self, update: Union[UpdatePinnedMessages,
+                                                         UpdatePinnedChannelMessages]) -> None:
+        if isinstance(update, UpdatePinnedMessages):
+            portal = po.Portal.get_by_entity(update.peer, receiver_id=self.tgid)
         else:
             portal = po.Portal.get_by_tgid(TelegramID(update.channel_id))
         if portal and portal.mxid:
-            await portal.receive_telegram_pin_id(update.id, self.tgid)
+            await portal.receive_telegram_pin_ids(update.messages, self.tgid,
+                                                  remove=not update.pinned)
 
     @staticmethod
     async def update_participants(update: UpdateChatParticipants) -> None:
@@ -389,14 +389,18 @@ class AbstractUser(ABC):
         elif isinstance(update, (UpdateNewMessage, UpdateNewChannelMessage,
                                  UpdateEditMessage, UpdateEditChannelMessage)):
             update = update.message
-            if isinstance(update.to_id, PeerUser) and not update.out:
-                portal = po.Portal.get_by_tgid(update.from_id, peer_type="user",
-                                               tg_receiver=self.tgid)
+            if isinstance(update, MessageEmpty):
+                return update, None, None
+            portal = po.Portal.get_by_entity(update.peer_id, receiver_id=self.tgid)
+            if update.out:
+                sender = pu.Puppet.get(self.tgid)
+            elif isinstance(update.from_id, PeerUser):
+                sender = pu.Puppet.get(TelegramID(update.from_id.user_id))
             else:
-                portal = po.Portal.get_by_entity(update.to_id, receiver_id=self.tgid)
-            sender = pu.Puppet.get(update.from_id) if update.from_id else None
+                sender = None
         else:
-            self.log.warning(f"Unexpected message type in User#get_message_details: {type(update)}")
+            self.log.warning("Unexpected message type in User#get_message_details: "
+                             f"{type(update)}")
             return update, None, None
         return update, sender, portal
 
@@ -416,6 +420,8 @@ class AbstractUser(ABC):
 
         for message_id in update.messages:
             for message in DBMessage.get_all_by_tgid(TelegramID(message_id), self.tgid):
+                if message.redacted:
+                    continue
                 message.delete()
                 number_left = DBMessage.count_spaces_by_mxid(message.mxid, message.mx_room)
                 if number_left == 0:
@@ -429,6 +435,8 @@ class AbstractUser(ABC):
 
         for message_id in update.messages:
             for message in DBMessage.get_all_by_tgid(TelegramID(message_id), channel_id):
+                if message.redacted:
+                    continue
                 message.delete()
                 await self._try_redact(message)
 
@@ -465,7 +473,7 @@ class AbstractUser(ABC):
                 await self.register_portal(portal)
                 return
             self.log.trace("Handling action %s to %s by %d", update.action, portal.tgid_log,
-                           0 if sender is None else sender.id)
+                           (sender.id if sender else 0))
             return await portal.handle_telegram_action(self, sender, update)
 
         if isinstance(original_update, (UpdateEditMessage, UpdateEditChannelMessage)):
