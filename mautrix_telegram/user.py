@@ -1,5 +1,5 @@
 # mautrix-telegram - A Matrix-Telegram puppeting bridge
-# Copyright (C) 2020 Tulir Asokan
+# Copyright (C) 2021 Tulir Asokan
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
@@ -16,26 +16,28 @@
 from typing import (Awaitable, Dict, List, Iterable, NamedTuple, Optional, Tuple, Any, cast,
                     TYPE_CHECKING)
 from collections import defaultdict
+from datetime import datetime, timezone
 import logging
 import asyncio
 
-from telethon.tl.types import (TypeUpdate, UpdateNewMessage, UpdateNewChannelMessage, PeerUser,
+from telethon.tl.types import (TypeUpdate, UpdateNewMessage, UpdateNewChannelMessage,
                                UpdateShortChatMessage, UpdateShortMessage, User as TLUser, Chat,
-                               ChatForbidden, Channel)
+                               ChatForbidden, UpdateFolderPeers, UpdatePinnedDialogs,
+                               UpdateNotifySettings, NotifyPeer, Channel)
 from telethon.tl.custom import Dialog
 from telethon.tl.types.contacts import ContactsNotModified
 from telethon.tl.functions.contacts import GetContactsRequest, SearchRequest
 from telethon.tl.functions.account import UpdateStatusRequest
 
 from mautrix.client import Client
-from mautrix.errors import MatrixRequestError
-from mautrix.types import UserID, RoomID
+from mautrix.errors import MatrixRequestError, MNotFound
+from mautrix.types import UserID, RoomID, PushRuleScope, PushRuleKind, PushActionType, RoomTagInfo
 from mautrix.bridge import BaseUser
 from mautrix.util.logging import TraceLogger
 from mautrix.util.opt_prometheus import Gauge
 
 from .types import TelegramID
-from .db import User as DBUser, Portal as DBPortal
+from .db import User as DBUser, Portal as DBPortal, Message as DBMessage
 from .abstract_user import AbstractUser
 from . import portal as po, puppet as pu
 
@@ -376,6 +378,106 @@ class User(AbstractUser, BaseUser):
             if portal.mxid
         }
 
+    async def _tag_room(self, puppet: pu.Puppet, portal: po.Portal, tag: str, active: bool
+                        ) -> None:
+        if not tag or not portal or not portal.mxid:
+            return
+        tag_info = await puppet.intent.get_room_tag(portal.mxid, tag)
+        if active and tag_info is None:
+            tag_info = RoomTagInfo(order=0.5)
+            tag_info[self.bridge.real_user_content_key] = True
+            await puppet.intent.set_room_tag(portal.mxid, tag, tag_info)
+        elif not active and tag_info and tag_info.get(self.bridge.real_user_content_key, False):
+            await puppet.intent.remove_room_tag(portal.mxid, tag)
+
+    @staticmethod
+    async def _mute_room(puppet: pu.Puppet, portal: po.Portal, mute_until: datetime) -> None:
+        if not config["bridge.mute_bridging"] or not portal or not portal.mxid:
+            return
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        if mute_until is not None and mute_until > now:
+            await puppet.intent.set_push_rule(PushRuleScope.GLOBAL, PushRuleKind.ROOM, portal.mxid,
+                                              actions=[PushActionType.DONT_NOTIFY])
+        else:
+            try:
+                await puppet.intent.remove_push_rule(PushRuleScope.GLOBAL, PushRuleKind.ROOM,
+                                                     portal.mxid)
+            except MNotFound:
+                pass
+
+    async def update_folder_peers(self, update: UpdateFolderPeers) -> None:
+        if config["bridge.tag_only_on_create"]:
+            return
+        puppet = await pu.Puppet.get_by_custom_mxid(self.mxid)
+        if not puppet or not puppet.is_real_user:
+            return
+        for peer in update.folder_peers:
+            portal = po.Portal.get_by_entity(peer.peer, receiver_id=self.tgid, create=False)
+            await self._tag_room(puppet, portal, config["bridge.archive_tag"],
+                                 peer.folder_id == 1)
+
+    async def update_pinned_dialogs(self, update: UpdatePinnedDialogs) -> None:
+        if config["bridge.tag_only_on_create"]:
+            return
+        puppet = await pu.Puppet.get_by_custom_mxid(self.mxid)
+        if not puppet or not puppet.is_real_user:
+            return
+        # TODO bridge unpinning properly
+        for pinned in update.order:
+            portal = po.Portal.get_by_entity(pinned.peer, receiver_id=self.tgid, create=False)
+            await self._tag_room(puppet, portal, config["bridge.pinned_tag"], True)
+
+    async def update_notify_settings(self, update: UpdateNotifySettings) -> None:
+        if config["bridge.tag_only_on_create"]:
+            return
+        elif not isinstance(update.peer, NotifyPeer):
+            # TODO handle global notification setting changes?
+            return
+        puppet = await pu.Puppet.get_by_custom_mxid(self.mxid)
+        if not puppet or not puppet.is_real_user:
+            return
+        portal = po.Portal.get_by_entity(update.peer.peer, receiver_id=self.tgid, create=False)
+        await self._mute_room(puppet, portal, update.notify_settings.mute_until)
+
+    async def _sync_dialog(self, portal: po.Portal, dialog: Dialog, should_create: bool,
+                           puppet: Optional[pu.Puppet]) -> None:
+        was_created = False
+        if portal.mxid:
+            try:
+                await portal.backfill(self, last_id=dialog.message.id)
+            except Exception:
+                self.log.exception(f"Error while backfilling {portal.tgid_log}")
+            try:
+                await portal.update_matrix_room(self, dialog.entity)
+            except Exception:
+                self.log.exception(f"Error while updating {portal.tgid_log}")
+        elif should_create:
+            try:
+                chat_type = ''
+                if isinstance(entity, Channel):
+                    chat_type = 'channel'
+                elif isinstance(entity, Chat):
+                    chat_type = 'group'
+                await portal.create_matrix_room(self, dialog.entity, invites=[self.mxid], chat_type=chat_type)
+                was_created = True
+            except Exception:
+                self.log.exception(f"Error while creating {portal.tgid_log}")
+        if portal.mxid and puppet and puppet.is_real_user:
+            tg_space = portal.tgid if portal.peer_type == "channel" else self.tgid
+            if dialog.unread_count == 0:
+                # This is usually more reliable than finding a specific message
+                # e.g. if the last read message is a service message that isn't in the message db
+                last_read = DBMessage.find_last(portal.mxid, tg_space)
+            else:
+                last_read = DBMessage.get_one_by_tgid(portal.tgid, tg_space,
+                                                      dialog.dialog.read_inbox_max_id)
+            if last_read:
+                await puppet.intent.mark_read(last_read.mx_room, last_read.mxid)
+            if was_created or not config["bridge.tag_only_on_create"]:
+                await self._mute_room(puppet, portal, dialog.dialog.notify_settings.mute_until)
+                await self._tag_room(puppet, portal, config["bridge.pinned_tag"], dialog.pinned)
+                await self._tag_room(puppet, portal, config["bridge.archive_tag"], dialog.archived)
+
     async def sync_dialogs(self) -> None:
         if self.is_bot:
             return
@@ -385,6 +487,7 @@ class User(AbstractUser, BaseUser):
         index = 0
         self.log.debug(f"Syncing dialogs (update_limit={update_limit}, "
                        f"create_limit={create_limit})")
+        puppet = await pu.Puppet.get_by_custom_mxid(self.mxid)
         dialog: Dialog
         async for dialog in self.client.iter_dialogs(limit=update_limit, ignore_migrated=True,
                                                      archived=False):
@@ -400,22 +503,9 @@ class User(AbstractUser, BaseUser):
                 continue
             portal = po.Portal.get_by_entity(entity, receiver_id=self.tgid)
             self.portals[portal.tgid_full] = portal
-            if portal.mxid:
-                update_task = portal.update_matrix_room(self, entity)
-                backfill_task = portal.backfill(self, last_id=dialog.message.id)
-                creators.append(self._catch(f"updating {portal.tgid_log}",
-                                            self.loop.create_task(update_task)))
-                creators.append(self._catch(f"backfilling {portal.tgid_log}",
-                                            self.loop.create_task(backfill_task)))
-            elif not create_limit or index < create_limit:
-                chat_type = ''
-                if isinstance(entity, Channel):
-                    chat_type = 'channel'
-                elif isinstance(entity, Chat):
-                    chat_type = 'group'
-                create_task = portal.create_matrix_room(self, entity, invites=[self.mxid], chat_type=chat_type)
-                creators.append(self._catch(f"creating {portal.tgid_log}",
-                                            self.loop.create_task(create_task)))
+            coro = self._sync_dialog(portal=portal, dialog=dialog, puppet=puppet,
+                                     should_create=not create_limit or index < create_limit)
+            creators.append(self.loop.create_task(coro))
             index += 1
         await self.save(portals=True)
         await asyncio.gather(*creators)
