@@ -453,6 +453,7 @@ class User(AbstractUser, BaseUser):
                 self.log.exception(f"Error while updating {portal.tgid_log}")
         elif should_create:
             try:
+                entity = dialog.entity
                 chat_type = ''
                 if isinstance(entity, Channel):
                     chat_type = 'channel'
