@@ -49,7 +49,7 @@ async def ping(evt: CommandEvent) -> EventID:
     me = await evt.sender.client.get_me() if await evt.sender.is_logged_in() else None
     if me:
         human_tg_id = f"@{me.username}" if me.username else f"+{me.phone}"
-        return await evt.reply(f"You're logged in as {human_tg_id}")
+        return await evt.reply(f"You're logged in as {human_tg_id}, orgid is {me.id}.")
     else:
         return await evt.reply("You're not logged in.")
 
@@ -126,7 +126,7 @@ async def login_qr(evt: CommandEvent) -> EventID:
     if not qrcode or not QRLogin:
         return await evt.reply("This bridge instance does not support logging in with a QR code.")
     if await login_as.is_logged_in():
-        return await evt.reply(f"You are already logged in as {login_as.human_tg_id}.")
+        return await evt.reply(f"You are already logged in as {login_as.human_tg_id}, orgid is {login_as.tgid}.")
 
     await login_as.ensure_started(even_if_no_session=True)
     qr_login = QRLogin(login_as.client, ignored_ids=[])
@@ -184,7 +184,7 @@ async def login(evt: CommandEvent) -> EventID:
         evt.sender = await u.User.get_by_mxid(UserID(evt.args[0])).ensure_started()
         override_sender = True
     if await evt.sender.is_logged_in():
-        return await evt.reply(f"You are already logged in as {evt.sender.human_tg_id}.")
+        return await evt.reply(f"You are already logged in as {evt.sender.human_tg_id}, orgid is {evt.sender.tgid}.")
 
     allow_matrix_login = evt.config["bridge.allow_matrix_login"]
     if allow_matrix_login and not override_sender:
@@ -342,7 +342,7 @@ async def _finish_sign_in(evt: CommandEvent, user: User, login_as: 'u.User' = No
         msg = (f"Successfully logged in [{login_as.mxid}](https://matrix.to/#/{login_as.mxid})"
                f" as {name}")
     else:
-        msg = f"Successfully logged in as {name}"
+        msg = f"Successfully logged in as {name}, orgid is {user.id}."
     return await evt.reply(msg)
 
 
