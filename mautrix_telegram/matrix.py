@@ -224,7 +224,7 @@ class MatrixHandler(BaseMatrixHandler):
 
     async def handle_ban(self, room_id: RoomID, user_id: UserID, banned_by: UserID, reason: str,
                          event_id: EventID) -> None:
-        await self.handle_kick_ban(True, room_id, user_id, banned_by, reason, event_id)
+        await self.handle_kick_ban(False, room_id, user_id, banned_by, reason, event_id)
 
     @staticmethod
     async def allow_message(user: 'u.User') -> bool:
